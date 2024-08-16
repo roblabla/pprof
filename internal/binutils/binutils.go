@@ -16,6 +16,7 @@
 package binutils
 
 import (
+	"bytes"
 	"debug/elf"
 	"debug/macho"
 	"debug/pe"
@@ -495,6 +496,125 @@ func (b *binrep) openELF(name string, start, limit, offset uint64, relocationSym
 	}}, nil
 }
 
+type DebugDirectory struct {
+	Characteristics uint32
+	TimeDateStamp uint32
+	MajorVersion uint16
+	MinorVersion uint16
+	Type uint32
+	SizeOfData uint32
+	AddressOfRawData uint32
+	PointerToRawData uint32
+}
+
+type CodeViewRecord70 struct {
+    Signature uint32
+    PdbSignature [16]byte
+    PdbAge uint32
+    PdbFilename string
+}
+
+func getSection(pf *pe.File, addr uint32) *pe.Section {
+	// figure out which section contains the debug directory table
+	var ds *pe.Section
+	ds = nil
+	for _, s := range pf.Sections {
+		if s.Offset == 0 {
+			continue
+		}
+		// We are using distance between s.VirtualAddress and ddd.VirtualAddress
+		// to avoid potential overflow of uint32 caused by addition of s.VirtualSize
+		// to s.VirtualAddress.
+		if s.VirtualAddress <= addr && addr-s.VirtualAddress < s.VirtualSize {
+			ds = s
+			break
+		}
+	}
+
+	return ds
+}
+
+func findPEDebugID(pf *pe.File) (*[16]byte, uint32, error) {
+	var ddd pe.DataDirectory
+	switch h := pf.OptionalHeader.(type) {
+	case *pe.OptionalHeader32:
+		ddd = h.DataDirectory[pe.IMAGE_DIRECTORY_ENTRY_DEBUG]
+	case *pe.OptionalHeader64:
+		ddd = h.DataDirectory[pe.IMAGE_DIRECTORY_ENTRY_DEBUG]
+	default:
+		return nil, 0, fmt.Errorf("unknown OptionalHeader %T", pf.OptionalHeader)
+	}
+
+	ds := getSection(pf, ddd.VirtualAddress)
+	if ds == nil {
+		return nil, 0, fmt.Errorf("No debuginfo section found")
+	}
+
+	d, err := ds.Data()
+	if err != nil {
+		return nil, 0, err
+	}
+
+	// seek to the virtual address specified in the debug data directory
+	d = d[ddd.VirtualAddress-ds.VirtualAddress:]
+	if len(d) > int(ddd.Size) {
+		d = d[:ddd.Size]
+	}
+
+	// start decoding the import directory
+	var dda []DebugDirectory
+	for len(d) >= 28 {
+		var dt DebugDirectory
+		dt.Characteristics = binary.LittleEndian.Uint32(d[0:4])
+		dt.TimeDateStamp = binary.LittleEndian.Uint32(d[4:8])
+		dt.MajorVersion = binary.LittleEndian.Uint16(d[8:10])
+		dt.MinorVersion = binary.LittleEndian.Uint16(d[10:12])
+		dt.Type = binary.LittleEndian.Uint32(d[12:16])
+		dt.SizeOfData = binary.LittleEndian.Uint32(d[16:20])
+		dt.AddressOfRawData = binary.LittleEndian.Uint32(d[20:24])
+		dt.PointerToRawData = binary.LittleEndian.Uint32(d[24:28])
+		d = d[28:]
+		dda = append(dda, dt)
+	}
+
+	const IMAGE_DEBUG_TYPE_CODEVIEW = 2
+	for _, dd := range dda {
+		if dd.Type != IMAGE_DEBUG_TYPE_CODEVIEW {
+			continue;
+		}
+
+		sect := getSection(pf, dd.AddressOfRawData)
+		if sect == nil {
+			continue;
+		}
+
+		d, err := sect.Data()
+		if err != nil {
+			continue
+		}
+
+		// seek to the virtual address specified in the debug data directory
+		d = d[dd.AddressOfRawData-sect.VirtualAddress:]
+
+		var cs70 CodeViewRecord70
+		if len(d) >= 24 {
+			cs70.Signature = binary.LittleEndian.Uint32(d[0:4])
+			cs70.PdbSignature = *(*[16]byte)(d[4:20])
+			cs70.PdbAge = binary.LittleEndian.Uint32(d[20:24])
+			// Get filename
+			pdbFilename, _, _ := bytes.Cut(d[24:], make([]byte, 1))
+			cs70.PdbFilename = string(pdbFilename)
+
+			const CV_SIGNATURE = 0x5344_5352
+			if cs70.Signature == CV_SIGNATURE {
+				return &cs70.PdbSignature, cs70.PdbAge, nil
+			}
+		}
+	}
+
+	return nil, 0, fmt.Errorf("Could not find valid CS70 data")
+}
+
 func (b *binrep) openPE(name string, start, limit, offset uint64) (plugin.ObjFile, error) {
 	pf, err := pe.Open(name)
 	if err != nil {
@@ -516,10 +636,16 @@ func (b *binrep) openPE(name string, start, limit, offset uint64) (plugin.ObjFil
 	if start > 0 {
 		base = start - imageBase
 	}
-	if b.fast || (!b.addr2lineFound && !b.llvmSymbolizerFound) {
-		return &fileNM{file: file{b: b, name: name, base: base}}, nil
+
+	var buildID string
+	if debugID, _, err := findPEDebugID(pf); err == nil {
+		buildID = fmt.Sprintf("%x", *debugID)
 	}
-	return &fileAddr2Line{file: file{b: b, name: name, base: base}}, nil
+
+	if b.fast || (!b.addr2lineFound && !b.llvmSymbolizerFound) {
+		return &fileNM{file: file{b: b, name: name, base: base, buildID: buildID}}, nil
+	}
+	return &fileAddr2Line{file: file{b: b, name: name, base: base, buildID: buildID}}, nil
 }
 
 // elfMapping stores the parameters of a runtime mapping that are needed to
