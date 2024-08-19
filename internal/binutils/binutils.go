@@ -356,6 +356,20 @@ func (bu *Binutils) Open(name string, start, limit, offset uint64, relocationSym
 	return nil, fmt.Errorf("unrecognized binary format: %s", name)
 }
 
+func findMachOUUID(of *macho.File) (string, error) {
+	bo := of.ByteOrder
+	for _, l := range of.Loads {
+		cmd := bo.Uint32(l.Raw()[0:4])
+		if cmd != 0x1b {
+			continue
+		}
+		if len(l.Raw()) >= 24 {
+			return fmt.Sprintf("%x", l.Raw()[8:24]), nil
+		}
+	}
+	return "", fmt.Errorf("Failed to find LC_UUID")
+}
+
 func (b *binrep) openMachOCommon(name string, of *macho.File, start, limit, offset uint64) (plugin.ObjFile, error) {
 
 	// Subtract the load address of the __TEXT section. Usually 0 for shared
@@ -373,10 +387,15 @@ func (b *binrep) openMachOCommon(name string, of *macho.File, start, limit, offs
 
 	base := start - textSegment.Addr
 
-	if b.fast || (!b.addr2lineFound && !b.llvmSymbolizerFound) {
-		return &fileNM{file: file{b: b, name: name, base: base}}, nil
+	buildID := ""
+	if id, err := findMachOUUID(of); err == nil {
+		buildID = id
 	}
-	return &fileAddr2Line{file: file{b: b, name: name, base: base}}, nil
+
+	if b.fast || (!b.addr2lineFound && !b.llvmSymbolizerFound) {
+		return &fileNM{file: file{b: b, name: name, base: base, buildID: buildID}}, nil
+	}
+	return &fileAddr2Line{file: file{b: b, name: name, base: base, buildID: buildID}}, nil
 }
 
 func (b *binrep) openFatMachO(name string, start, limit, offset uint64) (plugin.ObjFile, error) {
